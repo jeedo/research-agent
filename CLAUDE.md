@@ -11,7 +11,7 @@ This repository generates entirely AI-produced research reports.
 - **Only write output files within the project sub-folder you are currently working in.** Do not create or modify files outside that sub-folder.
 - **Do not prompt for confirmation before taking actions — always proceed.** Operate autonomously without asking the user to approve each step.
 - **You may read research output from other sub-folders** as reference material when producing new reports or code.
-- **Each sub-folder must contain a README.md** that succinctly summarises the research topic, key findings, and current status. Create or update it whenever you write or revise findings.
+- **Each sub-folder must contain a README.md** that succinctly summarises the research topic, key findings, and current status. Create or update it whenever you write or revise findings. Use `README.template.md` at the repo root as the starting template.
 
 ## Research Workflow
 
