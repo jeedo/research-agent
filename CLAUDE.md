@@ -21,6 +21,15 @@ This repository generates entirely AI-produced research reports.
 4. Cross-reference sibling folders as background context when relevant.
 5. Update the sub-folder README.md to reflect the latest state of the research.
 
+## Python Code Execution
+
+When research includes Python modules or code:
+
+- **Use `uv` for all Python package management** — install dependencies with `uv add <package>` or `uv pip install <package>`; never use `pip` directly.
+- **Run the code** and capture output as evidence to include in findings.
+- **Resolve any errors** encountered during execution — fix import errors, dependency conflicts, or runtime exceptions before reporting results.
+- **Record the execution results** (stdout, key outputs, or errors and their resolutions) in the findings file as supporting evidence.
+
 ## Findings Quality Standards
 
 - **Claim + evidence**: pair every finding with its supporting reasoning or source.
