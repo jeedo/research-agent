@@ -115,9 +115,11 @@ class TestRetries:
 
         @flow
         def flow_exhausting_retries():
-            return always_fails(return_state=True)
+            always_fails()
 
-        state = flow_exhausting_retries()
+        # Use return_state=True on the flow call; the flow itself fails when
+        # the task exhausts retries and raises.
+        state = flow_exhausting_retries(return_state=True)
         assert state.is_failed()
 
 
@@ -134,7 +136,9 @@ class TestTaskMapping:
 
         @flow
         def mapping_flow(items: list[int]) -> list[int]:
-            return double.map(items)
+            # Resolve PrefectFutureList to plain values before returning
+            futures = double.map(items)
+            return [f.result() for f in futures]
 
         result = mapping_flow([1, 2, 3, 4, 5])
         assert result == [2, 4, 6, 8, 10]
@@ -191,7 +195,8 @@ class TestOnFailureHook:
 
         flow_with_hook()
         assert len(hook_calls) == 1
-        assert hook_calls[0]["task"] == "intentionally-broken"
+        # Prefect 3.x auto-generates task names with underscores (not hyphens)
+        assert hook_calls[0]["task"] == "intentionally_broken"
 
 
 # ---------------------------------------------------------------------------

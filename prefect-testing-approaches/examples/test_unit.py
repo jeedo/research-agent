@@ -104,8 +104,9 @@ class TestLoadToSqliteMocked:
 
         # executemany was called with our records
         mock_cursor.executemany.assert_called_once()
-        _, args = mock_cursor.executemany.call_args
-        assert list(args[0]) == records
+        # call_args.args is (sql_string, records_iterable); index 1 is the records
+        positional, _ = mock_cursor.executemany.call_args
+        assert list(positional[1]) == records
 
     def test_connection_always_closed(self):
         mock_conn = MagicMock()
