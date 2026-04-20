@@ -1,6 +1,6 @@
 # SQLAlchemy Engine Inspection Tests
 
-> How correctly do SQLite, DuckDB, PostgreSQL, and MySQL implement the SQLAlchemy inspection contract for column types, nullability, defaults, PKs, FKs, and indexes?
+> How correctly do SQLite, DuckDB, PostgreSQL, MySQL, and IBM Db2 implement the SQLAlchemy inspection contract for column types, nullability, defaults, PKs, FKs, and indexes?
 
 ## Status
 
@@ -18,6 +18,8 @@
 - **pymysql conflicts with duckdb-engine in the same Python process** *(established)* — `pymysql` imports `cryptography` which uses cffi; on Debian/Ubuntu the system cryptography package conflicts with duckdb-engine's pyo3 runtime. Fix: use `mysql-connector-python` (`mysql+mysqlconnector://`) instead.
 
 - **Default value representations are inconsistent across engines** *(established)* — All databases return defaults as strings but with different formats: SQLite returns `'TRUE'`/`'0'`; PostgreSQL returns `'true'`/`'0'`; MySQL returns quoted numerics (`"'0'"`, `"'1'"`); DuckDB returns SQL cast expressions (`"CAST('t' AS BOOLEAN)"`). Do not compare defaults as literals across databases.
+
+- **IBM Db2 Community Edition exists and its Python driver is pip-installable, but could not be run here** *(established)* — `ibmcom/db2` Docker image requires `security.capability` xattrs during layer extraction, which the nested-container + kernel 4.4.0 environment does not support. The `ibm_db 3.2.8` / `ibm_db_sa 0.4.4` Python drivers install cleanly on Python 3.11. Expected Db2-specific quirks: no native BOOLEAN (uses SMALLINT), TEXT stored as CLOB. See `findings.md` for full setup instructions.
 
 ## Open Questions
 

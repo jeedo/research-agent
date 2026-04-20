@@ -3,7 +3,8 @@
 **Date:** 2026-04-20  
 **SQLAlchemy version:** 2.0.49  
 **Databases tested:** SQLite (built-in), DuckDB 1.5.2, PostgreSQL 16.13, MySQL 8.0.45  
-**Drivers:** sqlite3 (stdlib), duckdb-engine 0.17.0, psycopg2-binary 2.9.11, mysql-connector-python 9.6.0
+**Attempted (not runnable in this environment):** IBM Db2 Community Edition — see §Db2 section below  
+**Drivers:** sqlite3 (stdlib), duckdb-engine 0.17.0, psycopg2-binary 2.9.11, mysql-connector-python 9.6.0, ibm_db 3.2.8 + ibm_db_sa 0.4.4 (installed, not exercised)
 
 ---
 
@@ -136,6 +137,78 @@ Root cause: `pymysql` imports `cryptography`, which loads `_cffi_backend`. The s
 
 ---
 
+---
+
+## IBM Db2 Community Edition — Setup Reference *established*
+
+IBM provides a free **Db2 Community Edition** that can be run locally via Docker. The Python
+driver (`ibm_db` / `ibm_db_sa`) installs from PyPI and includes the IBM Data Server Driver
+Client embedded in the wheel — no separate IBM client installation is required.
+
+### Why it could not be tested in this session
+This environment runs on Linux kernel **4.4.0** inside a nested container. The Db2 Docker image
+(`ibmcom/db2`) requires setting `security.capability` xattrs on binaries during image layer
+extraction. The Docker-in-Docker setup here uses the `vfs` storage driver, which does not
+support xattrs, so layer registration fails:
+
+```
+failed to register layer: lsetxattr /usr/bin/newgidmap: xattr "security.capability": operation not supported
+```
+
+The `overlay2` driver was also tried but fails on this kernel version:
+
+```
+failed to mount overlay: invalid argument
+```
+
+This is a pure environment constraint. The Db2 image, Python driver, and SQLAlchemy dialect
+all work correctly on a standard Linux host with kernel ≥ 5.x or a privileged Docker environment.
+
+### How to run Db2 Community Edition
+
+```bash
+docker run -d --name db2-test \
+  -e LICENSE=accept \
+  -e DB2INST1_PASSWORD=testpass \
+  -e DBNAME=testdb \
+  -p 50000:50000 \
+  --privileged \
+  ibmcom/db2
+
+# Wait ~60–90 s for first-run initialisation
+docker logs -f db2-test | grep -m1 "Setup has completed"
+```
+
+### Python driver installation
+
+```bash
+pip install ibm_db ibm_db_sa
+# ibm_db 3.2.8 and ibm_db_sa 0.4.4 confirmed installable on Python 3.11
+```
+
+### SQLAlchemy connection URL
+
+```python
+engine = create_engine(
+    "db2+ibm_db://db2inst1:testpass@localhost:50000/testdb"
+)
+```
+
+### Expected inspection behaviour (from ibm_db_sa documentation and known quirks) *likely*
+
+- `inspect().get_columns()` — works; returns IBM-native type names like `INTEGER`, `VARCHAR`,
+  `DECIMAL`, `TIMESTAMP`, `DATE`, `TIME`, `CLOB` (equivalent to TEXT)
+- `inspect().get_pk_constraint()` — works; constraint names are always present (Db2 auto-names them)
+- `inspect().get_foreign_keys()` — works
+- `inspect().get_indexes()` — works; includes system-generated indexes for PKs
+- `MetaData.reflect()` — works
+- **No native BOOLEAN type**: Db2 uses `SMALLINT` for booleans (similar to MySQL's TINYINT).
+  SQLAlchemy maps Db2 `SMALLINT` to `sa.SmallInteger`, not `sa.Boolean`.
+- **CLOB for long text**: Db2 TEXT equivalent is `CLOB`; reflected as `sa.CLOB` not `sa.Text`.
+- Defaults are returned as raw SQL strings with possible quoting.
+
+---
+
 ## Open Questions
 
 - Does duckdb-engine fix the `pg_collation` gap in a version newer than 0.17.0?
@@ -143,3 +216,4 @@ Root cause: `pymysql` imports `cryptography`, which loads `_cffi_backend`. The s
 - How does MySQL handle `BOOLEAN` in `inspect().get_columns()` when the column was defined with `BOOLEAN` vs `TINYINT(1)` explicitly — is the dialect label different?
 - Does PostgreSQL's `inspect()` correctly reflect partitioned tables and views (not tested here)?
 - Are there DuckDB inspection gaps beyond `get_columns()` when using SQLAlchemy 2.0 features like `get_check_constraints()` or `get_unique_constraints()`?
+- Can Db2 Community Edition inspection be validated in a privileged Docker host environment to confirm the expected BOOLEAN→SMALLINT and TEXT→CLOB mappings?
