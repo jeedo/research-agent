@@ -6,6 +6,19 @@
 
 ---
 
+## Working Implementation
+
+`msauth-gpg-example/git-auth` is a Python CLI that demonstrates the full pattern:
+
+- Git password stored in `~/.git-auth/credentials.gpg` (GPG public-key encrypted)
+- Microsoft Entra ID access token (1 hour, no refresh token stored) gates vault access
+- On token expiry, MSAL device-code flow triggers → Azure AD sends push to Microsoft Authenticator → user approves → new token issued → vault decrypts
+- Registered as a standard `git credential helper`; git calls it automatically on push/pull
+
+See `msauth-gpg-example/README.md` for full setup instructions.
+
+---
+
 ## 1. OAuth 2.0 Device Authorization Grant (RFC 8628)
 
 **Claim**: RFC 8628 is the canonical standard for authorizing headless/input-constrained clients by pushing an authentication prompt to a secondary device.

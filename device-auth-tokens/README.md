@@ -33,3 +33,5 @@
 | File | Description |
 |------|-------------|
 | `findings.md` | Detailed findings across 8 mechanism categories, with evidence, confidence labels, lifetime tables, and open questions |
+| `msauth-gpg-example/git-auth` | Working Python CLI: GPG vault + Microsoft Authenticator push MFA token gate |
+| `msauth-gpg-example/README.md` | Step-by-step setup guide for the working example |

@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+"""
+git-auth — GPG-encrypted git credential helper with Microsoft Authenticator push MFA.
+
+A short-lived Microsoft Entra ID access token (default: 1 hour) gates access to a
+GPG-encrypted vault that holds your git password.  When the token expires the next
+git operation triggers a fresh device-code flow: Azure AD sends a push notification
+to Microsoft Authenticator, the user approves, and a new token is issued.
+
+No refresh token is stored, so every renewal requires explicit user acknowledgment.
+
+Usage
+─────
+  git-auth setup          Interactive setup: save Azure AD app config + encrypt git password
+  git-auth status         Show current token validity
+  git-auth unlock         Force re-authentication (send push now)
+  git-auth get            Git credential helper protocol — called automatically by git
+  git-auth store          Git credential helper protocol — no-op (vault is write-once)
+  git-auth erase          Git credential helper protocol — clears cached token
+
+Register with git
+─────────────────
+  git config --global credential.helper '/path/to/git-auth'
+
+Azure AD prerequisites
+──────────────────────
+  1. Register an app in Entra ID (portal.azure.com → App registrations → New)
+  2. Platform: Mobile and desktop applications
+  3. API permissions: Microsoft Graph → User.Read (delegated)
+  4. Enable "Allow public client flows" under Authentication
+  5. Note the Application (client) ID and Directory (tenant) ID
+  6. Ensure the user account has MFA configured (Microsoft Authenticator push)
+"""
+
+import getpass
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import msal
+except ImportError:
+    sys.exit("msal not found — run: pip install msal")
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+
+VAULT_DIR   = Path.home() / ".git-auth"
+CONFIG_FILE = VAULT_DIR / "config.json"
+TOKEN_FILE  = VAULT_DIR / "token.json"
+CREDS_FILE  = VAULT_DIR / "credentials.gpg"
+
+# ── Token helpers ─────────────────────────────────────────────────────────────
+
+def load_token():
+    """Return cached token dict if still valid, else None."""
+    if not TOKEN_FILE.exists():
+        return None
+    try:
+        data = json.loads(TOKEN_FILE.read_text())
+    except (json.JSONDecodeError, KeyError):
+        return None
+    if time.time() >= data.get("expires_at", 0):
+        return None
+    return data
+
+def save_token(response: dict):
+    """Persist only the access token and its expiry — no refresh token."""
+    expires_at = int(time.time()) + response.get("expires_in", 3600)
+    TOKEN_FILE.write_text(json.dumps({
+        "access_token": response["access_token"],
+        "expires_at":   expires_at,
+    }))
+    TOKEN_FILE.chmod(0o600)
+
+def expiry_str(token: dict) -> str:
+    dt = datetime.fromtimestamp(token["expires_at"], tz=timezone.utc).astimezone()
+    remaining = int(token["expires_at"] - time.time())
+    mins, secs = divmod(remaining, 60)
+    return f"valid until {dt.strftime('%H:%M %Z')} ({mins}m {secs}s remaining)"
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if not CONFIG_FILE.exists():
+        sys.exit("Not configured. Run: git-auth setup")
+    return json.loads(CONFIG_FILE.read_text())
+
+# ── Authentication ────────────────────────────────────────────────────────────
+
+# Scopes that trigger User.Read on Microsoft Graph.  offline_access is
+# intentionally omitted so Azure AD does not issue a refresh token — every
+# renewal forces the user back through the device-code flow (and the push).
+SCOPES = ["User.Read"]
+
+def authenticate(config: dict, force: bool = False) -> dict:
+    """
+    Return a valid token dict, triggering device-code flow (and push MFA) when needed.
+
+    The MSAL PublicClientApplication is created fresh each call with no persistent
+    cache, so there is no path for silent token renewal — expiry always means push.
+    """
+    if not force:
+        token = load_token()
+        if token:
+            return token
+
+    app = msal.PublicClientApplication(
+        client_id=config["client_id"],
+        authority=f"https://login.microsoftonline.com/{config['tenant_id']}",
+        # No token_cache argument → in-memory only, discarded after this call
+    )
+
+    flow = app.initiate_device_flow(scopes=SCOPES)
+    if "error" in flow:
+        sys.exit(f"Device flow initiation failed: {flow.get('error_description', flow)}")
+
+    # Print prompt to stderr so git credential stdout stays clean
+    print("\n" + flow["message"], file=sys.stderr)
+    print(
+        "After entering the code, Azure AD will send a push notification\n"
+        "to your Microsoft Authenticator app — approve it to continue.\n",
+        file=sys.stderr,
+    )
+
+    result = app.acquire_token_by_device_flow(flow)  # blocks until approved or timeout
+
+    if "error" in result:
+        sys.exit(f"Authentication failed: {result.get('error_description', result)}")
+
+    save_token(result)
+    token = load_token()
+    print(f"Authenticated. Token {expiry_str(token)}", file=sys.stderr)
+    return token
+
+# ── GPG vault ─────────────────────────────────────────────────────────────────
+
+def gpg_encrypt(plaintext: str, recipient: str):
+    """Encrypt plaintext to CREDS_FILE using the recipient's public GPG key."""
+    result = subprocess.run(
+        [
+            "gpg", "--quiet", "--batch", "--yes",
+            "--recipient", recipient,
+            "--output", str(CREDS_FILE),
+            "--encrypt",
+        ],
+        input=plaintext.encode(),
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        sys.exit(f"GPG encryption failed:\n{result.stderr.decode().strip()}")
+    CREDS_FILE.chmod(0o600)
+
+def gpg_decrypt() -> str:
+    """Decrypt CREDS_FILE and return plaintext (gpg-agent handles the passphrase)."""
+    result = subprocess.run(
+        ["gpg", "--quiet", "--batch", "--decrypt", str(CREDS_FILE)],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        sys.exit(f"GPG decryption failed:\n{result.stderr.decode().strip()}")
+    return result.stdout.decode()
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_setup():
+    print("=== git-auth setup ===\n")
+
+    # Azure AD app registration details
+    client_id = input("Azure AD Application (client) ID: ").strip()
+    tenant_id  = input("Azure AD Directory (tenant) ID:  ").strip()
+    gpg_recip  = input("GPG recipient (email or key fingerprint): ").strip()
+
+    VAULT_DIR.mkdir(mode=0o700, exist_ok=True)
+    config = {"client_id": client_id, "tenant_id": tenant_id, "gpg_recipient": gpg_recip}
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    CONFIG_FILE.chmod(0o600)
+    print(f"Config written to {CONFIG_FILE}\n")
+
+    # Git credentials to store in the vault
+    print("Git credentials to store in the vault:")
+    protocol = input("Protocol [https]: ").strip() or "https"
+    host     = input("Host (e.g. github.com): ").strip()
+    username = input("Username: ").strip()
+    password = getpass.getpass("Password / Personal Access Token: ")
+
+    plaintext = f"protocol={protocol}\nhost={host}\nusername={username}\npassword={password}\n"
+    gpg_encrypt(plaintext, gpg_recip)
+    print(f"Credentials encrypted to {CREDS_FILE}\n")
+
+    script = Path(sys.argv[0]).resolve()
+    print("Register this script as your git credential helper:")
+    print(f"  git config --global credential.helper '{script}'")
+    print(f"\nOr for a single repository:")
+    print(f"  git config credential.helper '{script}'")
+
+
+def cmd_status():
+    token = load_token()
+    if token:
+        print(f"Token: {expiry_str(token)}")
+        print(f"Vault: {CREDS_FILE} ({'present' if CREDS_FILE.exists() else 'MISSING'})")
+    else:
+        age = ""
+        if TOKEN_FILE.exists():
+            data = json.loads(TOKEN_FILE.read_text())
+            expired_ago = int(time.time() - data.get("expires_at", 0))
+            age = f" (expired {expired_ago}s ago)"
+        print(f"Token: expired{age} — next git operation will trigger a push notification")
+        print(f"Vault: {CREDS_FILE} ({'present' if CREDS_FILE.exists() else 'MISSING'})")
+
+
+def cmd_unlock():
+    """Force re-authentication regardless of token state."""
+    config = load_config()
+    force  = "--force" in sys.argv or "-f" in sys.argv
+    token  = authenticate(config, force=force)
+    print(f"Vault unlocked. Token {expiry_str(token)}")
+
+
+def cmd_get():
+    """
+    Git credential helper 'get' handler.
+
+    Git sends key=value pairs on stdin terminated by a blank line, then reads
+    key=value credential output on stdout.  We authenticate (pushing to the
+    user's phone if the token is expired) then decrypt and stream the vault.
+    """
+    # Consume git's stdin input (host/protocol/username hints)
+    hints = {}
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            break
+        if "=" in line:
+            k, _, v = line.partition("=")
+            hints[k] = v
+
+    config = load_config()
+    authenticate(config)       # sends push if token expired; blocks until approved
+    plaintext = gpg_decrypt()
+    sys.stdout.write(plaintext)
+    sys.stdout.flush()
+
+
+def cmd_store():
+    """Git credential helper 'store' — no-op; vault is managed by git-auth setup."""
+    pass
+
+
+def cmd_erase():
+    """Git credential helper 'erase' — clear the cached token, forcing next push."""
+    if TOKEN_FILE.exists():
+        TOKEN_FILE.unlink()
+        print("Token cleared. Next git operation will require re-authentication.", file=sys.stderr)
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+COMMANDS = {
+    "setup":  cmd_setup,
+    "status": cmd_status,
+    "unlock": cmd_unlock,
+    "get":    cmd_get,
+    "store":  cmd_store,
+    "erase":  cmd_erase,
+}
+
+def main():
+    # Strip leading flags so "git-auth unlock --force" still dispatches to unlock
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if not args:
+        print(__doc__)
+        sys.exit(0)
+    cmd = args[0]
+    if cmd not in COMMANDS:
+        sys.exit(f"Unknown command '{cmd}'. Known: {', '.join(COMMANDS)}")
+    COMMANDS[cmd]()
+
+if __name__ == "__main__":
+    main()
