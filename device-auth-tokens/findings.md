@@ -272,6 +272,32 @@ See `msauth-gpg-example/README.md` for full setup instructions.
 
 ---
 
+## Identity Binding Gap in Multi-Factor Vault Access
+
+**Claim**: Combining GPG decryption with a push-MFA token does not by itself prove the same person performed both operations; the two identity systems share no root of trust and must be explicitly cross-referenced.
+**Evidence**: Analysis of the `msauth-gpg-example` implementation; JWT claim structure in Azure AD access tokens.
+**Confidence**: *established*
+
+### The gap
+
+GPG public-key encryption proves only that the decryptor holds the private key matching the recipient specified at vault creation time. It has no knowledge of which Microsoft account approved the push notification. The token check and the GPG decryption are satisfied independently — a second person who holds a copy of the GPG private key can authenticate with their own Microsoft account, pass the token check, and decrypt the vault.
+
+### The fix: `owner_oid` binding
+
+Every Azure AD access token is a signed JWT containing an `oid` claim — the user's object ID, a stable UUID that never changes regardless of email or UPN changes. At vault creation time (`setup`), the script:
+
+1. Runs the full device-code flow and extracts `oid` from the returned token payload.
+2. Stores `owner_oid` in `config.json` (alongside `client_id` and `gpg_recipient`).
+3. On every subsequent authentication, decodes the new token and compares its `oid` against the stored `owner_oid`; a mismatch aborts before GPG decryption is attempted.
+
+This makes the vault openable only by the intersection of: (a) holder of the GPG private key AND (b) holder of the Microsoft account whose OID was recorded at setup time.
+
+### Remaining limitation
+
+The `oid`–to–GPG-key association is established by convention (the same person runs `setup`), not by a cryptographic proof linking the two identity systems. If `config.json` is tampered with, the check is defeated. A stronger approach would derive the GPG passphrase from the Microsoft token (e.g., using a key-wrapping scheme), but that requires more infrastructure and is outside the scope of the current implementation.
+
+---
+
 ## Cross-Cutting Patterns
 
 1. **Device binding is hardware-enforced** in modern implementations (Secure Enclave, StrongBox, TPM, YubiKey). Keys never leave secure hardware; compromise of the OS does not yield exportable secrets.

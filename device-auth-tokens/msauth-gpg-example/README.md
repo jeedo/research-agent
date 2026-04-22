@@ -179,6 +179,39 @@ This gives you the 8-hour window used by AWS IAM Identity Center, or any value i
 
 ---
 
+## Identity binding: same patron as vault creator
+
+GPG alone does **not** guarantee that the person decrypting is the person who created the vault. GPG only verifies possession of the private key — it has no knowledge of the Microsoft account involved.
+
+This script closes the gap during `setup`:
+
+1. Before encrypting the vault, `setup` runs the full device-code flow and extracts the `oid` claim from the returned JWT access token.  The `oid` is the Azure AD object identifier — a stable UUID that never changes regardless of email/UPN changes.
+2. The `oid` is written into `config.json` as `owner_oid`.
+3. On every subsequent authentication (i.e., every time a push notification is sent and approved), the `oid` in the new token is compared to the stored `owner_oid`.  A mismatch aborts with:
+
+```
+Identity mismatch: this vault was created by OID "aaaaaaaa-...".
+The authenticated account (other@example.com, OID "bbbbbbbb-...") does not match.
+Unlock must be performed by the same Microsoft account used during setup.
+```
+
+This means two independent factors must be satisfied by the **same person**:
+
+| Factor | What it proves | Bound to vault via |
+|---|---|---|
+| GPG private key | Possession of the key used to encrypt | `gpg_recipient` in config |
+| Microsoft Authenticator approval | Live acknowledgment from an enrolled device | `owner_oid` in config |
+
+An attacker who obtains only the GPG private key still cannot unlock the vault without also authenticating as the correct Microsoft account (and receiving a push notification on the original owner's enrolled phone).
+
+An attacker who somehow generates a valid Microsoft token for the correct account cannot decrypt the vault without also holding the GPG private key.
+
+### What the binding does not cover
+
+The `owner_oid`–to–GPG-key association is established by convention (you run `setup` as the intended user) not by cryptographic proof. There is no shared root of trust between the two identity systems. If the `config.json` file is tampered with (e.g., `owner_oid` replaced), the check is defeated. Protect `~/.git-auth/` accordingly (chmod 700, enforced by the script).
+
+---
+
 ## Security properties
 
 | Property | How it's achieved |
@@ -187,7 +220,7 @@ This gives you the 8-hour window used by AWS IAM Identity Center, or any value i
 | No refresh token stored | `offline_access` scope not requested; MSAL cache not persisted |
 | Every renewal requires user action | Device-code flow + push MFA on every token renewal |
 | MFA fatigue mitigation | Microsoft Authenticator number-matching (enabled by default in newer tenants) |
-| Token not reusable across devices | The GPG vault is local; the token proves auth but vault decryption requires the local GPG key |
+| Same-patron enforcement | `owner_oid` from setup JWT stored in config; verified on every new token |
 | Token not exportable | Token stored only in `~/.git-auth/token.json` (chmod 600) |
 
 ---

@@ -9,10 +9,17 @@ to Microsoft Authenticator, the user approves, and a new token is issued.
 
 No refresh token is stored, so every renewal requires explicit user acknowledgment.
 
+Identity binding
+────────────────
+During setup the script authenticates immediately and records the user's Azure AD
+object ID (OID) in config.json.  Every subsequent authentication verifies that the
+OID in the new token matches the stored OID.  A different Microsoft account — even
+one that holds the same GPG private key — cannot unlock the vault.
+
 Usage
 ─────
   git-auth setup          Interactive setup: save Azure AD app config + encrypt git password
-  git-auth status         Show current token validity
+  git-auth status         Show current token validity and bound identity
   git-auth unlock         Force re-authentication (send push now)
   git-auth get            Git credential helper protocol — called automatically by git
   git-auth store          Git credential helper protocol — no-op (vault is write-once)
@@ -32,9 +39,9 @@ Azure AD prerequisites
   6. Ensure the user account has MFA configured (Microsoft Authenticator push)
 """
 
+import base64
 import getpass
 import json
-import os
 import subprocess
 import sys
 import time
@@ -53,6 +60,26 @@ CONFIG_FILE = VAULT_DIR / "config.json"
 TOKEN_FILE  = VAULT_DIR / "token.json"
 CREDS_FILE  = VAULT_DIR / "credentials.gpg"
 
+# ── JWT helpers ───────────────────────────────────────────────────────────────
+
+def decode_jwt_payload(token_str: str) -> dict:
+    """
+    Decode the payload of a JWT without re-verifying the signature.
+
+    The signature was already verified by Azure AD during the device-code flow;
+    MSAL only returns a token after the server has validated it.  We decode here
+    solely to read identity claims (oid, preferred_username) for local binding.
+    """
+    parts = token_str.split(".")
+    if len(parts) != 3:
+        return {}
+    # JWT payload is base64url-encoded; pad to a multiple of 4
+    padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
+    try:
+        return json.loads(base64.urlsafe_b64decode(padded).decode())
+    except Exception:
+        return {}
+
 # ── Token helpers ─────────────────────────────────────────────────────────────
 
 def load_token():
@@ -68,11 +95,14 @@ def load_token():
     return data
 
 def save_token(response: dict):
-    """Persist only the access token and its expiry — no refresh token."""
+    """Persist access token, expiry, and the owner OID — no refresh token."""
+    claims     = decode_jwt_payload(response["access_token"])
     expires_at = int(time.time()) + response.get("expires_in", 3600)
     TOKEN_FILE.write_text(json.dumps({
         "access_token": response["access_token"],
         "expires_at":   expires_at,
+        "oid":          claims.get("oid", ""),
+        "upn":          claims.get("preferred_username", ""),
     }))
     TOKEN_FILE.chmod(0o600)
 
@@ -96,44 +126,59 @@ def load_config() -> dict:
 # renewal forces the user back through the device-code flow (and the push).
 SCOPES = ["User.Read"]
 
-def authenticate(config: dict, force: bool = False) -> dict:
-    """
-    Return a valid token dict, triggering device-code flow (and push MFA) when needed.
-
-    The MSAL PublicClientApplication is created fresh each call with no persistent
-    cache, so there is no path for silent token renewal — expiry always means push.
-    """
-    if not force:
-        token = load_token()
-        if token:
-            return token
-
+def _run_device_flow(config: dict) -> dict:
+    """Execute the MSAL device-code flow and return the raw token response."""
     app = msal.PublicClientApplication(
         client_id=config["client_id"],
         authority=f"https://login.microsoftonline.com/{config['tenant_id']}",
         # No token_cache argument → in-memory only, discarded after this call
     )
-
     flow = app.initiate_device_flow(scopes=SCOPES)
     if "error" in flow:
         sys.exit(f"Device flow initiation failed: {flow.get('error_description', flow)}")
 
-    # Print prompt to stderr so git credential stdout stays clean
     print("\n" + flow["message"], file=sys.stderr)
     print(
         "After entering the code, Azure AD will send a push notification\n"
         "to your Microsoft Authenticator app — approve it to continue.\n",
         file=sys.stderr,
     )
-
     result = app.acquire_token_by_device_flow(flow)  # blocks until approved or timeout
-
     if "error" in result:
         sys.exit(f"Authentication failed: {result.get('error_description', result)}")
+    return result
+
+def authenticate(config: dict, force: bool = False) -> dict:
+    """
+    Return a valid token dict, triggering device-code flow (and push MFA) when needed.
+
+    If config contains an owner_oid (set during setup), the OID in every new token
+    is verified against it.  A token belonging to a different Microsoft account is
+    rejected, preventing a different identity from unlocking this vault.
+    """
+    if not force:
+        token = load_token()
+        if token:
+            return token
+
+    result = _run_device_flow(config)
+    claims = decode_jwt_payload(result["access_token"])
+    incoming_oid = claims.get("oid", "")
+
+    # Identity binding check: reject tokens from any account other than the vault owner
+    owner_oid = config.get("owner_oid")
+    if owner_oid and incoming_oid != owner_oid:
+        upn = claims.get("preferred_username", "unknown")
+        sys.exit(
+            f"Identity mismatch: this vault was created by OID {owner_oid!r}.\n"
+            f"The authenticated account ({upn}, OID {incoming_oid!r}) does not match.\n"
+            "Unlock must be performed by the same Microsoft account used during setup."
+        )
 
     save_token(result)
     token = load_token()
-    print(f"Authenticated. Token {expiry_str(token)}", file=sys.stderr)
+    upn = token.get("upn", "")
+    print(f"Authenticated as {upn}. Token {expiry_str(token)}", file=sys.stderr)
     return token
 
 # ── GPG vault ─────────────────────────────────────────────────────────────────
@@ -169,16 +214,32 @@ def gpg_decrypt() -> str:
 def cmd_setup():
     print("=== git-auth setup ===\n")
 
-    # Azure AD app registration details
     client_id = input("Azure AD Application (client) ID: ").strip()
     tenant_id  = input("Azure AD Directory (tenant) ID:  ").strip()
     gpg_recip  = input("GPG recipient (email or key fingerprint): ").strip()
 
     VAULT_DIR.mkdir(mode=0o700, exist_ok=True)
+
+    # Write a partial config so authenticate() can run before owner_oid is known
     config = {"client_id": client_id, "tenant_id": tenant_id, "gpg_recipient": gpg_recip}
     CONFIG_FILE.write_text(json.dumps(config, indent=2))
     CONFIG_FILE.chmod(0o600)
-    print(f"Config written to {CONFIG_FILE}\n")
+
+    # Authenticate now to establish and record the vault owner's identity
+    print("\nAuthenticating to bind your Microsoft identity to this vault...")
+    result = _run_device_flow(config)
+    claims    = decode_jwt_payload(result["access_token"])
+    owner_oid = claims.get("oid")
+    owner_upn = claims.get("preferred_username", "")
+    if not owner_oid:
+        sys.exit("Could not extract OID from token — setup aborted. Check app permissions.")
+
+    # Seal the owner OID into the config; all future unlocks must match this identity
+    config["owner_oid"] = owner_oid
+    config["owner_upn"] = owner_upn  # human-readable label only, not used for comparison
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    save_token(result)
+    print(f"Vault bound to: {owner_upn} (OID: {owner_oid})\n")
 
     # Git credentials to store in the vault
     print("Git credentials to store in the vault:")
@@ -199,22 +260,33 @@ def cmd_setup():
 
 
 def cmd_status():
-    token = load_token()
+    config = load_config() if CONFIG_FILE.exists() else {}
+    token  = load_token()
+
+    owner_upn = config.get("owner_upn", "")
+    owner_oid = config.get("owner_oid", "")
+    if owner_oid:
+        print(f"Vault owner: {owner_upn} (OID: {owner_oid})")
+    else:
+        print("Vault owner: not bound (re-run setup)")
+
     if token:
-        print(f"Token: {expiry_str(token)}")
-        print(f"Vault: {CREDS_FILE} ({'present' if CREDS_FILE.exists() else 'MISSING'})")
+        print(f"Token:  {expiry_str(token)} — authenticated as {token.get('upn', '?')}")
     else:
         age = ""
         if TOKEN_FILE.exists():
-            data = json.loads(TOKEN_FILE.read_text())
-            expired_ago = int(time.time() - data.get("expires_at", 0))
-            age = f" (expired {expired_ago}s ago)"
-        print(f"Token: expired{age} — next git operation will trigger a push notification")
-        print(f"Vault: {CREDS_FILE} ({'present' if CREDS_FILE.exists() else 'MISSING'})")
+            try:
+                data = json.loads(TOKEN_FILE.read_text())
+                expired_ago = int(time.time() - data.get("expires_at", 0))
+                age = f" (expired {expired_ago}s ago)"
+            except Exception:
+                pass
+        print(f"Token:  expired{age} — next git operation will trigger a push notification")
+
+    print(f"Vault:  {CREDS_FILE} ({'present' if CREDS_FILE.exists() else 'MISSING'})")
 
 
 def cmd_unlock():
-    """Force re-authentication regardless of token state."""
     config = load_config()
     force  = "--force" in sys.argv or "-f" in sys.argv
     token  = authenticate(config, force=force)
@@ -229,7 +301,6 @@ def cmd_get():
     key=value credential output on stdout.  We authenticate (pushing to the
     user's phone if the token is expired) then decrypt and stream the vault.
     """
-    # Consume git's stdin input (host/protocol/username hints)
     hints = {}
     for line in sys.stdin:
         line = line.strip()
@@ -240,7 +311,7 @@ def cmd_get():
             hints[k] = v
 
     config = load_config()
-    authenticate(config)       # sends push if token expired; blocks until approved
+    authenticate(config)
     plaintext = gpg_decrypt()
     sys.stdout.write(plaintext)
     sys.stdout.flush()
@@ -270,7 +341,6 @@ COMMANDS = {
 }
 
 def main():
-    # Strip leading flags so "git-auth unlock --force" still dispatches to unlock
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
     if not args:
         print(__doc__)
